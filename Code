@@ -1,0 +1,284 @@
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ST7735.h> // Hardware-specific library for ST7735
+#include <Adafruit_ST7789.h> // Hardware-specific library for ST7789
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <config.h>
+#include <RTClib.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <Arduino_JSON.h>
+
+// Pin definitions (adaptes selon ton board)
+#if defined(ARDUINO_FEATHER_ESP32)
+  #define TFT_CS         14
+  #define TFT_RST        15
+  #define TFT_DC         32
+#elif defined(ESP8266)
+  #define TFT_CS         4
+  #define TFT_RST        16
+  #define TFT_DC         5
+#else
+  #define TFT_CS        D3
+  #define TFT_RST       D6
+  #define TFT_DC        D7
+#endif
+
+#define BME_SCK 13
+#define BME_MISO 12
+#define BME_MOSI 11
+#define BME_CS 10
+
+#define SEALEVELPRESSURE_HPA (1014)
+
+RTC_DS3231 rtc;
+char daysOfTheWeek[7][12] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+const char* serverName = "http://preprodapi.mde.epf.fr";
+const int micPin = 2; // Entrée analogique du micro
+const int samples = 200; // Nombre d'échantillons
+
+Adafruit_BME280 bme;
+String sensorReadings;
+
+AdafruitIO_Feed *dec = io.feed("Décibel");
+AdafruitIO_Feed *CO2 = io.feed("Valeur de CO2");
+AdafruitIO_Feed *temp = io.feed("Température");
+AdafruitIO_Feed *press = io.feed("Pression");
+AdafruitIO_Feed *alt = io.feed("Altitude");
+AdafruitIO_Feed *hum = io.feed("Humide");
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+unsigned long lastTime = 0;
+unsigned long timerDelay = 3000;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastAdafruitSend = 0;
+const unsigned long displayInterval = 1000;   // 1 seconde
+const unsigned long adafruitInterval = 15000; // 15 secondes
+
+// --- VARIABLES PARTAGÉES ---
+float co2Value = 0.0;   // <-- déclaré globalement pour être utilisé par l'affichage et l'envoi
+float dB = 0.0;
+float voltage = 0.0;
+float signalMax = 0;
+float signalMin = 4095;
+float peakToPeak = 0;
+float Vrms = 0;
+
+void setup(void) {
+  Serial.begin(115200);
+  io.connect();
+  while (io.status() < AIO_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (! rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    Serial.flush();
+    while (1) delay(10);
+  }
+
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, let's set the time!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  Serial.println(F("BME280 test"));
+  unsigned status = bme.begin(0x76);
+  if (!status) {
+    Serial.println("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
+    while (1) delay(10);
+  }
+
+  Serial.println(F("Hello! ST77xx TFT Test"));
+  tft.initR(INITR_BLACKTAB);
+  Serial.println(F("Initialized"));
+  tft.fillScreen(ST77XX_BLACK);
+  testdrawtext("TEST ", ST77XX_WHITE);
+}
+
+void loop() {
+  io.run();
+  DateTime now = rtc.now();
+  unsigned long currentMillis = millis();
+
+  // --- Mise à jour écran (toutes les displayInterval) ---
+  if (currentMillis - lastDisplayUpdate >= displayInterval) {
+    lastDisplayUpdate = currentMillis;
+
+    // Lecture données capteurs depuis serveur
+    sensorReadings = httpGETRequest(serverName);
+    int jsonStart = sensorReadings.indexOf('[');
+    if (jsonStart > 0) {
+      sensorReadings = sensorReadings.substring(jsonStart);
+    }
+
+    JSONVar myArray = JSON.parse(sensorReadings);
+    if (JSON.typeof(myArray) == "undefined") {
+      Serial.println("Parsing input failed!");
+      // on continue l'exécution — on garde la dernière co2Value connue
+    } else {
+      String value = "0";
+      if (myArray.length() > 1) {
+        JSONVar latestMeasure = myArray[1];
+        value = (const char*) latestMeasure["value"];
+      }
+      co2Value = value.toFloat(); // <- mise à jour de la variable globale
+    }
+
+    // Mesures micro (50 ms)
+    signalMax = 0;
+    signalMin = 4095;
+    unsigned long start = millis();
+    while (millis() - start < 50) {
+      int sample = analogRead(micPin);
+      if (sample < signalMin) signalMin = sample;
+      if (sample > signalMax) signalMax = sample;
+    }
+    peakToPeak = signalMax - signalMin;
+    voltage = (peakToPeak * 3.3) / 4095.0;
+    Vrms = voltage / 2.0;
+    // dB = 20.0 * log10(Vrms / 0.0000324);
+    dB = 38.491 * log(Vrms) + 99.962 + 30;
+  if (dB < 0) dB = 0;
+  if (dB > 120) dB = 120;
+
+    // Mesures BME (pour affichage)
+    float temperature = bme.readTemperature();
+    float pressure = bme.readPressure() / 100.0F;
+    float altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+    float humidity = bme.readHumidity();
+
+    // Affichage TFT
+    tft.fillScreen(ST77XX_BLACK);
+    char buffer[48];
+
+    tft.setCursor(0, 0);
+    sprintf(buffer, "%04d/%02d/%02d", now.year(), now.month(), now.day());
+    testdrawtext(buffer, ST77XX_WHITE);
+    
+    tft.setCursor(30,8);
+    
+
+    tft.setCursor(0, 15);
+    sprintf(buffer, "Temp: %.2f C", temperature);
+    testdrawtext(buffer, ST77XX_RED);
+
+    tft.setCursor(0, 25);
+    sprintf(buffer, "Press: %.2f hPa", pressure);
+    testdrawtext(buffer, ST77XX_GREEN);
+
+    tft.setCursor(0, 50);
+    sprintf(buffer, "Alt: %.2f m", altitude);
+    testdrawtext(buffer, ST77XX_BLUE);
+
+    tft.setCursor(0, 75);
+    sprintf(buffer, "Hum: %.2f %%", humidity);
+    testdrawtext(buffer, ST77XX_YELLOW);
+
+    tft.setCursor(0, 100);
+    sprintf(buffer, "Decibel: %.2f dB", dB);
+    testdrawtext(buffer, ST77XX_YELLOW);
+
+    tft.setCursor(0, 125);
+    sprintf(buffer, "CO2 : %.2f ppm", co2Value);
+    testdrawtext(buffer, ST77XX_WHITE);
+
+    sprintf(buffer, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    tft.setCursor(30, 150);
+    testdrawtext(buffer, ST77XX_ORANGE);
+
+    printValues();
+  }
+
+  // --- Envoi à Adafruit IO (toutes les adafruitInterval) ---
+  if (currentMillis - lastAdafruitSend >= adafruitInterval) {
+    lastAdafruitSend = currentMillis;
+
+    // Log avant envoi
+    Serial.print("CO2 envoyé : ");
+    Serial.println(co2Value);
+
+    // Mise à jour des mesures BME au moment de l'envoi
+    float temperature = bme.readTemperature();
+    float pressure = bme.readPressure() / 100.0F;
+    float altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+    float humidity = bme.readHumidity();
+
+    // Refaire lecture micro rapide
+    signalMax = 0;
+    signalMin = 4095;
+    unsigned long start = millis();
+    while (millis() - start < 50) {
+      int sample = analogRead(micPin);
+      if (sample < signalMin) signalMin = sample;
+      if (sample > signalMax) signalMax = sample;
+    }
+    peakToPeak = signalMax - signalMin;
+    voltage = (peakToPeak * 3.3) / 4095.0;
+    Vrms = voltage / 2.0;
+    dB = 20.0 * log10(Vrms / 0.0000324);
+
+    // Envoi à Adafruit IO : utilise la variable globale co2Value
+    CO2->save(co2Value);
+    dec->save(dB);
+    temp->save(temperature);
+    press->save(pressure);
+    alt->save(altitude);
+    hum->save(humidity);
+
+    Serial.println("⬆ Données envoyées à Adafruit IO !");
+  }
+}
+
+void testdrawtext(char *text, uint16_t color) {
+  tft.setTextColor(color);
+  tft.setTextWrap(true);
+  tft.print(text);
+}
+
+void printValues() {
+  Serial.print("Temperature = ");
+  Serial.print(bme.readTemperature());
+  Serial.println(" °C");
+  Serial.print("Pressure = ");
+  Serial.print(bme.readPressure() / 100.0F);
+  Serial.println(" hPa");
+  Serial.print("Approx. Altitude = ");
+  Serial.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
+  Serial.println(" m");
+  Serial.print("Humidity = ");
+  Serial.print(bme.readHumidity());
+  Serial.println(" %");
+  Serial.println();
+}
+
+String httpGETRequest(const char* serverName) {
+  WiFiClient client;
+  String payload = "{}";
+  if (client.connect("preprodapi.mde.epf.fr", 80)) {
+    client.println(String("GET ") + "/measure.php?id=997&row_count=100 HTTP/1.1");
+    client.println("Host: preprodapi.mde.epf.fr");
+    client.println("Connection: close");
+    client.println();
+  } else {
+    Serial.println("Connection failed");
+    return payload;
+  }
+  unsigned long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 5000) {
+      Serial.println(">>> Client Timeout !");
+      client.stop();
+      return payload;
+    }
+  }
+  while (client.available()) {
+    payload += client.readStringUntil('\r');
+  }
+  client.stop();
+  return payload;
+}
